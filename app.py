@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -42,8 +43,14 @@ API_LIST_PATH = "/list"
 MAX_JOBS_FOR_LLM = 40
 MODEL_NAME = "gpt-4o-mini"
 
-# API numOfRows 선택지 (selectbox)
+# API numOfRows 선택지 (selectbox) — 화면 표·페이지 이동용
 NUM_OF_ROWS_OPTIONS = [10, 20, 30, 50, 100]
+
+# AI 추천 전용: 여러 페이지를 한꺼번에 수집할 때의 설정
+# numOfRows=100 × max_pages=10 → 최대 1,000건까지 API에서 모음
+RECOMMEND_NUM_OF_ROWS = 100
+RECOMMEND_MAX_PAGES = 10
+RECOMMEND_MAX_JOBS = RECOMMEND_NUM_OF_ROWS * RECOMMEND_MAX_PAGES
 
 # LLM·표시에 쓰는 표준 열 이름 (기존 code/app.py와 동일)
 STANDARD_COLUMNS = ["기관명", "직무", "근무지", "우대사항", "필요역량", "채용설명"]
@@ -211,6 +218,113 @@ def fetch_recruitment_list(
     return raw_df, total_count
 
 
+@dataclass
+class FetchAllJobsResult:
+    """
+    fetch_all_jobs_for_recommendation 반환값.
+
+    jobs_df: AI 추천에 쓸 표준 형식 공고 DataFrame
+    pages_fetched: 실제로 호출에 성공한 페이지 수
+    total_count: API가 알려준 전체 공고 수(totalCount, 1페이지 응답 기준)
+    warnings: 일부 페이지 실패 시 사용자에게 보여줄 경고 문구 목록
+    """
+
+    jobs_df: pd.DataFrame
+    pages_fetched: int
+    total_count: int
+    warnings: list[str] = field(default_factory=list)
+
+
+def fetch_all_jobs_for_recommendation(
+    service_key: str,
+    num_of_rows: int = RECOMMEND_NUM_OF_ROWS,
+    max_pages: int = RECOMMEND_MAX_PAGES,
+) -> FetchAllJobsResult:
+    """
+    AI 추천 전용 — 화면에 보이는 한 페이지가 아니라, 여러 페이지를 연속 호출해
+    공고를 최대한 많이 모읍니다.
+
+    동작 요약:
+    1. pageNo=1부터 순서대로 API 호출
+    2. 한 번에 num_of_rows(기본 100)건씩 요청
+    3. 최대 max_pages(기본 10)페이지까지만 호출 → 최대 1,000건
+    4. 1페이지 응답의 totalCount로 전체 페이지 수를 계산하고,
+       그 값과 max_pages 중 작은 쪽까지만 추가 호출
+    5. 중간에 오류가 나면 그때까지 모은 데이터만 반환하고 warnings에 기록
+
+    화면의 페이지네이션(UI)과는 별개로 동작합니다.
+    """
+    warnings: list[str] = []
+    raw_frames: list[pd.DataFrame] = []
+    total_count = 0
+    page_no = 1
+    # 1페이지 응답 후 totalCount를 알면 줄어들 수 있음 (기본값은 max_pages)
+    pages_to_fetch = max_pages
+
+    while page_no <= pages_to_fetch:
+        try:
+            raw_df, total = fetch_recruitment_list(
+                service_key,
+                page_no=page_no,
+                num_of_rows=num_of_rows,
+            )
+        except PublicDataApiError as e:
+            # 마지막 페이지 이후 빈 결과는 정상 종료로 처리
+            if raw_frames and "조회된 채용공고가 없습니다" in str(e):
+                break
+            warnings.append(f"pageNo={page_no} API 오류: {e}")
+            break
+        except Exception as e:
+            warnings.append(f"pageNo={page_no} 처리 오류: {e}")
+            break
+
+        if page_no == 1:
+            total_count = total
+            # totalCount 기준 전체 페이지 수 계산 후 max_pages를 넘지 않게 제한
+            api_pages = calc_total_pages(total_count, num_of_rows)
+            pages_to_fetch = min(max_pages, api_pages)
+
+        if raw_df.empty:
+            break
+
+        raw_frames.append(raw_df)
+
+        # 이미 전체 건수만큼 모였으면 더 호출하지 않음
+        collected = sum(len(df) for df in raw_frames)
+        if total_count > 0 and collected >= total_count:
+            break
+        # API가 요청보다 적은 건수를 주면 마지막 페이지로 간주
+        if len(raw_df) < num_of_rows:
+            break
+
+        page_no += 1
+
+    if not raw_frames:
+        raise PublicDataApiError(
+            "추천용 채용공고를 가져오지 못했습니다. "
+            "API 키·네트워크·트래픽 한도를 확인한 뒤 다시 시도해 주세요."
+        )
+
+    combined_raw = pd.concat(raw_frames, ignore_index=True)
+
+    # 같은 공고가 여러 페이지에 겹치지 않도록 고유 번호로 중복 제거
+    if "recrutPblntSn" in combined_raw.columns:
+        combined_raw = combined_raw.drop_duplicates(subset=["recrutPblntSn"], keep="first")
+
+    jobs_df = api_raw_to_standard_df(combined_raw)
+
+    # 안전 상한: 설정상 최대 1,000건
+    if len(jobs_df) > RECOMMEND_MAX_JOBS:
+        jobs_df = jobs_df.head(RECOMMEND_MAX_JOBS).reset_index(drop=True)
+
+    return FetchAllJobsResult(
+        jobs_df=jobs_df,
+        pages_fetched=len(raw_frames),
+        total_count=total_count,
+        warnings=warnings,
+    )
+
+
 def api_raw_to_standard_df(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
     API 원본 DataFrame을 추천·표시용 표준 한글 열 DataFrame으로 바꿉니다.
@@ -320,12 +434,14 @@ def fetch_recommendations(
     jobs_df: pd.DataFrame,
 ) -> list[dict[str, Any]]:
     """OpenAI API로 TOP 3 추천 JSON을 받아 파싱."""
+    collected = len(jobs_df)
     user_content = (
         "## 취준생 정보\n"
         f"{profile_to_text(profile)}\n\n"
-        "## 채용공고 목록 (공공데이터 API)\n"
+        f"## 채용공고 목록 (공공데이터 API, 수집 {collected:,}건)\n"
         f"{jobs_to_text(jobs_df)}\n\n"
-        "위 정보를 바탕으로 이 취준생에게 가장 적합한 공고 TOP 3를 추천하세요."
+        f"위 {collected:,}건을 검토한 범위 안에서 "
+        "이 취준생에게 가장 적합한 공고 TOP 3를 추천하세요."
     )
 
     response = client.chat.completions.create(
@@ -536,25 +652,53 @@ def main() -> None:
             f"전체 **{total_count:,}건** (totalCount)"
         )
         st.dataframe(build_display_table(raw_df), use_container_width=True, hide_index=True)
-        with st.expander("AI 추천에 사용하는 표준 데이터 미리보기"):
+        with st.expander("현재 페이지 데이터 미리보기 (추천은 여러 페이지를 별도 수집)"):
             st.dataframe(jobs_df, use_container_width=True, hide_index=True)
 
     # --- 3. AI 추천 ---
     st.header("3. AI 추천")
+    st.caption(
+        f"추천 시 API를 pageNo=1부터 최대 **{RECOMMEND_MAX_PAGES}페이지** "
+        f"(numOfRows={RECOMMEND_NUM_OF_ROWS}) 자동 호출 → "
+        f"최대 **{RECOMMEND_MAX_JOBS:,}건** 검토 후 TOP 3를 생성합니다. "
+        "아래 표에 보이는 페이지와는 별도로 동작합니다."
+    )
     recommend_clicked = st.button("추천받기", type="primary", use_container_width=True)
 
     if recommend_clicked:
         if not profile["name"] or not profile["desired_job"]:
             st.warning("이름과 희망 직무는 필수입니다.")
             st.stop()
-        if jobs_df is None or jobs_df.empty:
-            st.warning("먼저 「채용공고 불러오기」로 공고를 불러와 주세요.")
+
+        # 여러 페이지 수집 (화면 표 데이터와 분리)
+        with st.spinner(
+            f"추천용 공고 수집 중… (최대 {RECOMMEND_MAX_PAGES}페이지 × "
+            f"{RECOMMEND_NUM_OF_ROWS}건)"
+        ):
+            try:
+                collect_result = fetch_all_jobs_for_recommendation(DATA_GO_KR_API_KEY)
+            except PublicDataApiError as e:
+                st.error(str(e))
+                st.stop()
+            except Exception as e:
+                st.error(f"공고 수집 중 오류: {e}")
+                st.stop()
+
+        # 일부 페이지만 실패한 경우: 수집된 분량으로 계속 + 경고
+        for warn_msg in collect_result.warnings:
+            st.warning(warn_msg)
+
+        recommend_jobs_df = collect_result.jobs_df
+        reviewed_count = len(recommend_jobs_df)
+
+        if reviewed_count == 0:
+            st.error("추천에 사용할 공고가 없습니다.")
             st.stop()
 
-        with st.spinner("AI가 공고를 비교하고 있습니다..."):
+        with st.spinner(f"AI가 {reviewed_count:,}건의 공고를 비교하고 있습니다..."):
             try:
                 client = OpenAI(api_key=OPENAI_API_KEY)
-                recommendations = fetch_recommendations(client, profile, jobs_df)
+                recommendations = fetch_recommendations(client, profile, recommend_jobs_df)
             except json.JSONDecodeError:
                 st.error("AI 응답을 해석하지 못했습니다. 잠시 후 다시 시도해 주세요.")
                 st.stop()
@@ -564,13 +708,22 @@ def main() -> None:
 
         st.session_state["last_recommendations"] = recommendations
         st.session_state["last_profile_name"] = profile["name"]
+        st.session_state["last_reviewed_count"] = reviewed_count
+        st.session_state["last_pages_fetched"] = collect_result.pages_fetched
 
     # --- 4. TOP 3 결과 ---
     if st.session_state.get("last_recommendations"):
         st.header("4. TOP 3 추천 결과")
         who = st.session_state.get("last_profile_name", "")
+        reviewed = st.session_state.get("last_reviewed_count", 0)
+        pages_done = st.session_state.get("last_pages_fetched", 0)
+        if reviewed:
+            st.info(
+                f"총 **{reviewed:,}건**의 공고를 검토했습니다 "
+                f"(API {pages_done}페이지 수집 · 페이지당 {RECOMMEND_NUM_OF_ROWS}건 기준)."
+            )
         if who:
-            st.info(f"**{who}** 님을 위한 맞춤 추천입니다.")
+            st.success(f"**{who}** 님을 위한 맞춤 추천입니다.")
         for rec in st.session_state["last_recommendations"]:
             render_recommendation_card(rec)
 
